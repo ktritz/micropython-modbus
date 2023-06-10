@@ -10,7 +10,11 @@
 # Description summary taken from
 # https://modbus.org/docs/Modbus_Application_Protocol_V1_1b3.pdf
 
-from micropython import const
+try:
+    from micropython import const
+except ModuleNotFoundError:
+    def const(value):
+        return value
 
 # function codes
 # defined as const(), see https://github.com/micropython/micropython/issues/573

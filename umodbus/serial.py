@@ -9,11 +9,36 @@
 #
 
 # system packages
-from machine import UART
-from machine import Pin
+# from machine import UART
+try:
+    from busio import UART
+except:
+    from serial import Serial as UART
+try:
+    from microcontroller import Pin
+    import board
+    import usb_cdc
+    import digitalio
+except:
+    class Pin:
+        pass
+    pass
+
 import struct
 import time
-import machine
+try:
+    from adafruit_ticks import ticks_ms, ticks_diff
+except:
+    from time import perf_counter
+
+    def ticks_ms():
+        return perf_counter()*1000
+    
+    def ticks_diff(t1, t2):
+        return t1-t2
+    
+# import machine
+
 
 # custom packages
 from . import const as Const
@@ -44,8 +69,10 @@ class ModbusRTU(Modbus):
     :type       pins:        List[Union[int, Pin], Union[int, Pin]]
     :param      ctrl_pin:    The control pin
     :type       ctrl_pin:    int
-    :param      uart_id:     The ID of the used UART
-    :type       uart_id:     int
+    :param      usb:         Use usb "console" or "data" serial connection
+    :type       usb:         string
+    :param      port:        Use PC com port
+    :type       port:        string
     """
     def __init__(self,
                  addr: int,
@@ -55,34 +82,38 @@ class ModbusRTU(Modbus):
                  parity: Optional[int] = None,
                  pins: List[Union[int, Pin], Union[int, Pin]] = None,
                  ctrl_pin: int = None,
-                 uart_id: int = 1):
+                 usb: str = None,
+                 port: str = None,
+                 ):
         super().__init__(
             # set itf to Serial object, addr_list to [addr]
-            Serial(uart_id=uart_id,
-                   baudrate=baudrate,
+            Serial(baudrate=baudrate,
                    data_bits=data_bits,
                    stop_bits=stop_bits,
                    parity=parity,
                    pins=pins,
-                   ctrl_pin=ctrl_pin),
+                   ctrl_pin=ctrl_pin,
+                   usb=usb,
+                   port=port,
+                   ),
             [addr]
-        )
+            )
 
 
 class Serial(CommonModbusFunctions):
     def __init__(self,
-                 uart_id: int = 1,
                  baudrate: int = 9600,
                  data_bits: int = 8,
                  stop_bits: int = 1,
                  parity=None,
                  pins: List[Union[int, Pin], Union[int, Pin]] = None,
-                 ctrl_pin: int = None):
+                 ctrl_pin: int = None,
+                 usb: str = None,
+                 port: str = None,
+                 ):
         """
         Setup Serial/RTU Modbus
 
-        :param      uart_id:     The ID of the used UART
-        :type       uart_id:     int
         :param      baudrate:    The baudrate, default 9600
         :type       baudrate:    int
         :param      data_bits:   The data bits, default 8
@@ -95,29 +126,54 @@ class Serial(CommonModbusFunctions):
         :type       pins:        List[Union[int, Pin], Union[int, Pin]]
         :param      ctrl_pin:    The control pin
         :type       ctrl_pin:    int
+        :param      usb:         Use usb "console" or "data" serial connection
+        :type       usb:         string
+        :param      port:        Use PC com port
+        :type       port:        string
         """
-        self._uart = UART(uart_id,
-                          baudrate=baudrate,
-                          bits=data_bits,
-                          parity=parity,
-                          stop=stop_bits,
-                          # timeout_chars=2,  # WiPy only
-                          # pins=pins         # WiPy only
-                          tx=pins[0],
-                          rx=pins[1]
-                          )
-
-        if ctrl_pin is not None:
-            self._ctrlPin = Pin(ctrl_pin, mode=Pin.OUT)
+        if port is not None:
+            self._uart = UART(port=port,
+                              baudrate=baudrate,
+                              bytesize=data_bits,
+                              parity=parity,
+                              stopbits=stop_bits,
+                              timeout=1,
+                              write_timeout=1,
+                              )
+        elif usb is not None:
+            try:
+                self._uart = getattr(usb_cdc, usb)
+                self._ctrlPin = None
+            except AttributeError:
+                print(f"Unknown usb_cdc device {usb}.")
+                return
         else:
-            self._ctrlPin = None
+            if pins is None:
+                try:
+                    pins = [board.TX, board.RX]
+                except AttributeError:
+                    print("No default TX/RX pins defined for board.")
+                    return
+            self._uart = UART(baudrate=baudrate,
+                              bits=data_bits,
+                              parity=parity,
+                              stop=stop_bits,
+                              tx=pins[0],
+                              rx=pins[1],
+                              )
 
-        self._t1char = (1000000 * (data_bits + stop_bits + 2)) // baudrate
+            if ctrl_pin is not None:
+                self._ctrlPin = digitalio.DigitalInOut(ctrl_pin)
+                self._ctrlPin.switch_to_output()
+            else:
+                self._ctrlPin = None
+
+        self._t1char = (1000 * (data_bits + stop_bits + 2)) // baudrate
         if baudrate <= 19200:
             # 4010us (approx. 4ms) @ 9600 baud
-            self._t35chars = (3500000 * (data_bits + stop_bits + 2)) // baudrate
+            self._t35chars = (3500 * (data_bits + stop_bits + 2)) // baudrate
         else:
-            self._t35chars = 1750   # 1750us (approx. 1.75ms)
+            self._t35chars = 1.750   # 1750us (approx. 1.75ms)
 
     def _calculate_crc16(self, data: bytearray) -> bytes:
         """
@@ -168,17 +224,17 @@ class Serial(CommonModbusFunctions):
         response = bytearray()
 
         for x in range(1, 40):
-            if self._uart.any():
+            if self._uart.in_waiting:
                 # WiPy only
                 # response.extend(self._uart.readall())
-                response.extend(self._uart.read())
+                response.extend(self._uart.read(self._uart.in_waiting))
 
                 # variable length function codes may require multiple reads
                 if self._exit_read(response):
                     break
 
             # wait for the maximum time between two frames
-            time.sleep_us(self._t35chars)
+            time.sleep(self._t35chars/1e3)
 
         return response
 
@@ -197,23 +253,23 @@ class Serial(CommonModbusFunctions):
         # set timeout to at least twice the time between two frames in case the
         # timeout was set to zero or None
         if timeout == 0 or timeout is None:
-            timeout = 2 * self._t35chars  # in milliseconds
+            timeout = 2 * self._t35chars  # in msec
 
-        start_us = time.ticks_us()
+        start_ms = ticks_ms()
 
         # stay inside this while loop at least for the timeout time
-        while (time.ticks_diff(time.ticks_us(), start_us) <= timeout):
+        while ticks_diff(ticks_ms(), start_ms) <= timeout:
             # check amount of available characters
-            if self._uart.any():
+            if self._uart.in_waiting:
                 # remember this time in microseconds
-                last_byte_ts = time.ticks_us()
+                last_byte_ts = ticks_ms()
 
                 # do not stop reading and appending the result to the buffer
                 # until the time between two frames elapsed
-                while time.ticks_diff(time.ticks_us(), last_byte_ts) <= self._t35chars:
+                while ticks_diff(ticks_ms(), last_byte_ts) <= self._t35chars:
                     # WiPy only
                     # r = self._uart.readall()
-                    r = self._uart.read()
+                    r = self._uart.read(self._uart.in_waiting)
 
                     # if something has been read after the first iteration of
                     # this inner while loop (during self._t35chars time)
@@ -222,7 +278,7 @@ class Serial(CommonModbusFunctions):
                         received_bytes.extend(r)
 
                         # update the timestamp of the last byte being read
-                        last_byte_ts = time.ticks_us()
+                        last_byte_ts = ticks_ms()
 
             # if something has been read before the overall timeout is reached
             if len(received_bytes) > 0:
@@ -250,17 +306,17 @@ class Serial(CommonModbusFunctions):
         serial_pdu.extend(crc)
 
         if self._ctrlPin:
-            self._ctrlPin(1)
-            time.sleep_us(1000)     # wait until the control pin really changed
-            send_start_time = time.ticks_us()
+            self._ctrlPin.value = True
+            time.sleep(0.001)     # wait until the control pin really changed
+            send_start_time = ticks_ms()
 
         self._uart.write(serial_pdu)
 
         if self._ctrlPin:
-            total_frame_time_us = self._t1char * len(serial_pdu)
-            while time.ticks_us() <= send_start_time + total_frame_time_us:
-                machine.idle()
-            self._ctrlPin(0)
+            total_frame_time_ms = self._t1char * len(serial_pdu)
+            while ticks_ms() <= send_start_time + total_frame_time_ms:
+                time.sleep(0.001)
+            self._ctrlPin.value = False
 
     def _send_receive(self,
                       modbus_pdu: bytes,
@@ -280,7 +336,7 @@ class Serial(CommonModbusFunctions):
         :rtype:     bytes
         """
         # flush the Rx FIFO
-        self._uart.read()
+        self._uart.reset_input_buffer()
 
         self._send(modbus_pdu=modbus_pdu, slave_addr=slave_addr)
 
