@@ -9,36 +9,40 @@
 #
 
 # system packages
-# from machine import UART
-try:
-    from busio import UART
+try: # micropython imports
+    from machine import UART
+    from machine import Pin
+    import machine
+    from time import ticks_ms, ticks_diff, sleep_ms
 except:
-    from serial import Serial as UART
-try:
-    from microcontroller import Pin
-    import board
-    import usb_cdc
-    import digitalio
-except:
-    class Pin:
-        pass
-    pass
+    from time import sleep
+
+    def sleep_ms(value):
+        return sleep(value/1000)
+    
+    try: # circuitpython imports
+        from busio import UART
+        from microcontroller import Pin
+        import board
+        import usb_cdc
+        import digitalio
+        from adafruit_ticks import ticks_ms, ticks_diff
+    except: # PC imports
+        from serial import Serial as UART
+        from time import perf_counter
+
+        def ticks_ms():
+            return perf_counter()*1000
+        
+        def ticks_diff(t1, t2):
+            return t1-t2
+        
+        class Pin:
+            pass
+
+      
 
 import struct
-import time
-try:
-    from adafruit_ticks import ticks_ms, ticks_diff
-except:
-    from time import perf_counter
-
-    def ticks_ms():
-        return perf_counter()*1000
-    
-    def ticks_diff(t1, t2):
-        return t1-t2
-    
-# import machine
-
 
 # custom packages
 from . import const as Const
@@ -69,6 +73,8 @@ class ModbusRTU(Modbus):
     :type       pins:        List[Union[int, Pin], Union[int, Pin]]
     :param      ctrl_pin:    The control pin
     :type       ctrl_pin:    int
+    :param      uart_id:     The ID of the used UART (micropython only)
+    :type       uart_id:     int
     :param      usb:         Use usb "console" or "data" serial connection
     :type       usb:         string
     :param      port:        Use PC com port
@@ -82,6 +88,7 @@ class ModbusRTU(Modbus):
                  parity: Optional[int] = None,
                  pins: List[Union[int, Pin], Union[int, Pin]] = None,
                  ctrl_pin: int = None,
+                 uart_id: int = 1,
                  usb: str = None,
                  port: str = None,
                  ):
@@ -93,6 +100,7 @@ class ModbusRTU(Modbus):
                    parity=parity,
                    pins=pins,
                    ctrl_pin=ctrl_pin,
+                   uart_id=uart_id,
                    usb=usb,
                    port=port,
                    ),
@@ -108,6 +116,7 @@ class Serial(CommonModbusFunctions):
                  parity=None,
                  pins: List[Union[int, Pin], Union[int, Pin]] = None,
                  ctrl_pin: int = None,
+                 uart_id: int = 1,
                  usb: str = None,
                  port: str = None,
                  ):
@@ -126,12 +135,14 @@ class Serial(CommonModbusFunctions):
         :type       pins:        List[Union[int, Pin], Union[int, Pin]]
         :param      ctrl_pin:    The control pin
         :type       ctrl_pin:    int
+        :param      uart_id:     The ID of the used UART (micropython only)
+        :type       uart_id:     int
         :param      usb:         Use usb "console" or "data" serial connection
         :type       usb:         string
         :param      port:        Use PC com port
         :type       port:        string
         """
-        if port is not None:
+        if port is not None: # PC UART
             self._uart = UART(port=port,
                               baudrate=baudrate,
                               bytesize=data_bits,
@@ -140,7 +151,7 @@ class Serial(CommonModbusFunctions):
                               timeout=1,
                               write_timeout=1,
                               )
-        elif usb is not None:
+        elif usb is not None: # Circuitpython usb serial
             try:
                 self._uart = getattr(usb_cdc, usb)
                 self._ctrlPin = None
@@ -154,19 +165,33 @@ class Serial(CommonModbusFunctions):
                 except AttributeError:
                     print("No default TX/RX pins defined for board.")
                     return
-            self._uart = UART(baudrate=baudrate,
-                              bits=data_bits,
-                              parity=parity,
-                              stop=stop_bits,
-                              tx=pins[0],
-                              rx=pins[1],
-                              )
+            try: # try micropython uart first with uart_id
+                self._uart = UART(uart_id,
+                                baudrate=baudrate,
+                                bits=data_bits,
+                                parity=parity,
+                                stop=stop_bits,
+                                tx=pins[0],
+                                rx=pins[1],
+                                )
+                if ctrl_pin is not None:
+                    self._ctrlPin = Pin(ctrl_pin, mode=Pin.OUT)
+                else:
+                    self._ctrlPin = None
+            except: # fallback to circuitpython uart
+                self._uart = UART(baudrate=baudrate,
+                                bits=data_bits,
+                                parity=parity,
+                                stop=stop_bits,
+                                tx=pins[0],
+                                rx=pins[1],
+                                )
 
-            if ctrl_pin is not None:
-                self._ctrlPin = digitalio.DigitalInOut(ctrl_pin)
-                self._ctrlPin.switch_to_output()
-            else:
-                self._ctrlPin = None
+                if ctrl_pin is not None:
+                    self._ctrlPin = digitalio.DigitalInOut(ctrl_pin)
+                    self._ctrlPin.switch_to_output()
+                else:
+                    self._ctrlPin = None
 
         self._t1char = (1000 * (data_bits + stop_bits + 2)) // baudrate
         if baudrate <= 19200:
@@ -234,7 +259,7 @@ class Serial(CommonModbusFunctions):
                     break
 
             # wait for the maximum time between two frames
-            time.sleep(self._t35chars/1e3)
+            sleep_ms(self._t35chars)
 
         return response
 
@@ -307,7 +332,7 @@ class Serial(CommonModbusFunctions):
 
         if self._ctrlPin:
             self._ctrlPin.value = True
-            time.sleep(0.001)     # wait until the control pin really changed
+            sleep_ms(1)     # wait until the control pin really changed
             send_start_time = ticks_ms()
 
         self._uart.write(serial_pdu)
@@ -315,7 +340,7 @@ class Serial(CommonModbusFunctions):
         if self._ctrlPin:
             total_frame_time_ms = self._t1char * len(serial_pdu)
             while ticks_ms() <= send_start_time + total_frame_time_ms:
-                time.sleep(0.001)
+                sleep_ms(1)
             self._ctrlPin.value = False
 
     def _send_receive(self,

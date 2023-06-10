@@ -10,9 +10,9 @@
 # Description summary taken from
 # https://modbus.org/docs/Modbus_Application_Protocol_V1_1b3.pdf
 
-try:
+try: # micropython/circuitpython
     from micropython import const
-except ModuleNotFoundError:
+except ModuleNotFoundError: # PC
     def const(value):
         return value
 

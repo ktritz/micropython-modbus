@@ -13,13 +13,16 @@ This class is inherited by the Modbus client implementations
 """
 
 # system packages
-# import time
-try:
-    from adafruit_ticks import ticks_ms
+try: # micropython impport
+    from time import ticks_ms
 except:
-    from time import perf_counter
-    def ticks_ms():
-        return perf_counter()*1000
+    try: # circuitpython import
+        from adafruit_ticks import ticks_ms
+    except: # PC import
+        from time import perf_counter
+        
+        def ticks_ms():
+            return perf_counter()*1000
 
 # custom packages
 from . import functions
