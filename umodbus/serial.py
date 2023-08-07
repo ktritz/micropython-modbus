@@ -196,9 +196,9 @@ class Serial(CommonModbusFunctions):
         self._t1char = (1000 * (data_bits + stop_bits + 2)) // baudrate
         if baudrate <= 19200:
             # 4010us (approx. 4ms) @ 9600 baud
-            self._t35chars = (3500 * (data_bits + stop_bits + 2)) // baudrate
+            self._inter_frame_delay = (3500 * self._t1char) // 1000
         else:
-            self._t35chars = 1.750   # 1750us (approx. 1.75ms)
+            self._inter_frame_delay = 1.750   # 1750us (approx. 1.75ms)
 
     def _calculate_crc16(self, data: bytearray) -> bytes:
         """
@@ -224,17 +224,19 @@ class Serial(CommonModbusFunctions):
         :param      response:    The response
         :type       response:    bytearray
 
-        :returns:   State of basic read response evaluation
+        :returns:   State of basic read response evaluation,
+                    True if entire response has been read
         :rtype:     bool
         """
-        if response[1] >= Const.ERROR_BIAS:
-            if len(response) < Const.ERROR_RESP_LEN:
+        response_len = len(response)
+        if response_len >= 2 and response[1] >= Const.ERROR_BIAS:
+            if response_len < Const.ERROR_RESP_LEN:
                 return False
-        elif (Const.READ_COILS <= response[1] <= Const.READ_INPUT_REGISTER):
+        elif response_len >= 3 and (Const.READ_COILS <= response[1] <= Const.READ_INPUT_REGISTER):
             expected_len = Const.RESPONSE_HDR_LENGTH + 1 + response[2] + Const.CRC_LENGTH
-            if len(response) < expected_len:
+            if response_len < expected_len:
                 return False
-        elif len(response) < Const.FIXED_RESP_LEN:
+        elif response_len < Const.FIXED_RESP_LEN:
             return False
 
         return True
@@ -259,7 +261,7 @@ class Serial(CommonModbusFunctions):
                     break
 
             # wait for the maximum time between two frames
-            sleep_ms(self._t35chars)
+            sleep_ms(self._inter_frame_delay)
 
         return response
 
@@ -278,7 +280,7 @@ class Serial(CommonModbusFunctions):
         # set timeout to at least twice the time between two frames in case the
         # timeout was set to zero or None
         if timeout == 0 or timeout is None:
-            timeout = 2 * self._t35chars  # in msec
+            timeout = 2 * self._inter_frame_delay  # in msec
 
         start_ms = ticks_ms()
 
@@ -291,13 +293,13 @@ class Serial(CommonModbusFunctions):
 
                 # do not stop reading and appending the result to the buffer
                 # until the time between two frames elapsed
-                while ticks_diff(ticks_ms(), last_byte_ts) <= self._t35chars:
+                while ticks_diff(ticks_ms(), last_byte_ts) <= self._inter_frame_delay:
                     # WiPy only
                     # r = self._uart.readall()
                     r = self._uart.read(self._uart.in_waiting)
 
                     # if something has been read after the first iteration of
-                    # this inner while loop (during self._t35chars time)
+                    # this inner while loop (during self._inter_frame_delay time)
                     if r is not None:
                         # append the new read stuff to the buffer
                         received_bytes.extend(r)
@@ -316,31 +318,49 @@ class Serial(CommonModbusFunctions):
         """
         Send Modbus frame via UART
 
-        If a flow control pin has been setup, it will be controller accordingly
+        If a flow control pin has been setup, it will be controlled accordingly
 
         :param      modbus_pdu:  The modbus Protocol Data Unit
         :type       modbus_pdu:  bytes
         :param      slave_addr:  The slave address
         :type       slave_addr:  int
         """
-        serial_pdu = bytearray()
-        serial_pdu.append(slave_addr)
-        serial_pdu.extend(modbus_pdu)
-
-        crc = self._calculate_crc16(serial_pdu)
-        serial_pdu.extend(crc)
+        # modbus_adu: Modbus Application Data Unit
+        # consists of the Modbus PDU, with slave address prepended and checksum appended
+        modbus_adu = bytearray()
+        modbus_adu.append(slave_addr)
+        modbus_adu.extend(modbus_pdu)
+        modbus_adu.extend(self._calculate_crc16(modbus_adu))
 
         if self._ctrlPin:
             self._ctrlPin.value = True
-            sleep_ms(1)     # wait until the control pin really changed
-            send_start_time = ticks_ms()
+            sleep_ms(0.2)     # wait until the control pin really changed
 
-        self._uart.write(serial_pdu)
+        # the timing of this part is critical:
+        # - if we disable output too early,
+        #   the command will not be received in full
+        # - if we disable output too late,
+        #   the incoming response will lose some data at the beginning
+        # easiest to just wait for the bytes to be sent out on the wire
+
+        send_start_time = ticks_ms()
+
+        self._uart.write(modbus_adu)
+        send_finish_time = ticks_ms()
+
+
+        if False: # self._has_uart_flush:
+            self._uart.flush()
+            time.sleep_us(self._t1char)
+        else:
+            sleep_time_ms = (
+                self._t1char * len(modbus_adu) -    # total frame time in ms
+                ticks_diff(send_finish_time, send_start_time) +
+                0.1     # only required at baudrates above 57600, but hey 100us
+            )
+            sleep_ms(sleep_time_ms)
 
         if self._ctrlPin:
-            total_frame_time_ms = self._t1char * len(serial_pdu)
-            while ticks_ms() <= send_start_time + total_frame_time_ms:
-                sleep_ms(1)
             self._ctrlPin.value = False
 
     def _send_receive(self,
@@ -360,7 +380,7 @@ class Serial(CommonModbusFunctions):
         :returns:   Validated response content
         :rtype:     bytes
         """
-        # flush the Rx FIFO
+        # flush the Rx FIFO buffer
         self._uart.reset_input_buffer()
 
         self._send(modbus_pdu=modbus_pdu, slave_addr=slave_addr)
